@@ -1,703 +1,522 @@
+/* This file handles the LINK and UNLINK system calls.  It also deals with
+ * deallocating the storage used by a file when the last UNLINK is done to a
+ * file and the blocks must be returned to the free block pool.
+ *
+ * The entry points into this file are
+ *   do_link:         perform the LINK system call
+ *   do_unlink:	      perform the UNLINK and RMDIR system calls
+ *   do_rename:	      perform the RENAME system call
+ *   do_truncate:     perform the TRUNCATE system call
+ *   do_ftruncate:    perform the FTRUNCATE system call
+ *   do_rdlink:       perform the RDLNK system call
+ */
+
 #include "fs.h"
 #include <sys/stat.h>
 #include <string.h>
 #include <minix/com.h>
-#include "buf.h"
-#include "inode.h"
-#include "super.h"
+#include <minix/callnr.h>
 #include <minix/vfsif.h>
-#include <sys/param.h>
-
-#define SAME 1000
-
-
-static int freesp_inode(struct inode *rip, off_t st, off_t end);
-static int remove_dir(struct inode *rldirp, struct inode *rip, char
-	dir_name[MFS_NAME_MAX]);
-static int unlink_file(struct inode *dirp, struct inode *rip, char
-	file_name[MFS_NAME_MAX]);
-static off_t nextblock(off_t pos, int zone_size);
-static void zerozone_half(struct inode *rip, off_t pos, int half, int
-	zone_size);
-static void zerozone_range(struct inode *rip, off_t pos, off_t len);
-
-/* Args to zerozone_half() */
-#define FIRST_HALF	0
-#define LAST_HALF	1
-
+#include <sys/dirent.h>
+#include <assert.h>
+#include "file.h"
+#include "path.h"
+#include "vnode.h"
+#include "scratchpad.h"
 
 /*===========================================================================*
- *				fs_link 				     *
+ *				do_link					     *
  *===========================================================================*/
-int fs_link()
+int do_link(void)
 {
 /* Perform the link(name1, name2) system call. */
+  int r = OK;
+  struct vnode *vp = NULL, *dirp = NULL;
+  struct vmnt *vmp1 = NULL, *vmp2 = NULL;
+  char fullpath[PATH_MAX];
+  struct lookup resolve;
+  vir_bytes vname1, vname2;
+  size_t vname1_length, vname2_length;
 
-  struct inode *ip, *rip;
-  register int r;
-  char string[MFS_NAME_MAX];
-  struct inode *new_ip;
-  phys_bytes len;
+  vname1 = job_m_in.m_lc_vfs_link.name1;
+  vname1_length = job_m_in.m_lc_vfs_link.len1;
+  vname2 = job_m_in.m_lc_vfs_link.name2;
+  vname2_length = job_m_in.m_lc_vfs_link.len2;
 
-  len = min(fs_m_in.m_vfs_fs_link.path_len, sizeof(string));
-  /* Copy the link name's last component */
-  r = sys_safecopyfrom(VFS_PROC_NR, fs_m_in.m_vfs_fs_link.grant,
-  		       (vir_bytes) 0, (vir_bytes) string, (size_t) len);
-  if (r != OK) return r;
-  NUL(string, len, sizeof(string));
-  
-  /* Temporarily open the file. */
-  if( (rip = get_inode(fs_dev, fs_m_in.m_vfs_fs_link.inode)) == NULL)
-	  return(EINVAL);
-  
-  /* Check to see if the file has maximum number of links already. */
-  r = OK;
-  if(rip->i_nlinks >= LINK_MAX)
-	  r = EMLINK;
+  lookup_init(&resolve, fullpath, PATH_NOFLAGS, &vmp1, &vp);
+  resolve.l_vmnt_lock = VMNT_WRITE;
+  resolve.l_vnode_lock = VNODE_READ;
 
-  /* Only super_user may link to directories. */
-  if(r == OK)
-	  if( (rip->i_mode & I_TYPE) == I_DIRECTORY && caller_uid != SU_UID) 
-		  r = EPERM;
+  /* See if 'name1' (file to be linked to) exists. */
+  if (fetch_name(vname1, vname1_length, fullpath) != OK) return(err_code);
+  if ((vp = eat_path(&resolve, fp)) == NULL) return(err_code);
 
-  /* If error with 'name', return the inode. */
+  /* Does the final directory of 'name2' exist? */
+  lookup_init(&resolve, fullpath, PATH_NOFLAGS, &vmp2, &dirp);
+  resolve.l_vmnt_lock = VMNT_READ;
+  resolve.l_vnode_lock = VNODE_WRITE;
+  if (fetch_name(vname2, vname2_length, fullpath) != OK)
+	r = err_code;
+  else if ((dirp = last_dir(&resolve, fp)) == NULL)
+	r = err_code;
+
   if (r != OK) {
-	  put_inode(rip);
-	  return(r);
+	unlock_vnode(vp);
+	unlock_vmnt(vmp1);
+	put_vnode(vp);
+	return(r);
   }
 
-  /* Temporarily open the last dir */
-  if( (ip = get_inode(fs_dev, fs_m_in.m_vfs_fs_link.dir_ino)) == NULL) {
-	put_inode(rip);
-	return(EINVAL);
-  }
+  /* Check for links across devices. */
+  if (vp->v_fs_e != dirp->v_fs_e)
+	r = EXDEV;
+  else
+	r = forbidden(fp, dirp, W_BIT | X_BIT);
 
-  if (ip->i_nlinks == NO_LINK) {	/* Dir does not actually exist */
-  	put_inode(rip);
-	put_inode(ip);
-  	return(ENOENT);
-  }
+  if (r == OK)
+	r = req_link(vp->v_fs_e, dirp->v_inode_nr, fullpath,
+		     vp->v_inode_nr);
 
-  /* If 'name2' exists in full (even if no space) set 'r' to error. */
-  if((new_ip = advance(ip, string, IGN_PERM)) == NULL) {
-	  r = err_code;
-	  if(r == ENOENT)
-		  r = OK;
-  } else {
-	  put_inode(new_ip);
-	  r = EEXIST;
-  }
-  
-  /* Try to link. */
-  if(r == OK)
-	  r = search_dir(ip, string, &rip->i_num, ENTER, IGN_PERM);
-
-  /* If success, register the linking. */
-  if(r == OK) {
-	  rip->i_nlinks++;
-	  rip->i_update |= CTIME;
-	  IN_MARKDIRTY(rip);
-  }
-  
-  /* Done.  Release both inodes. */
-  put_inode(rip);
-  put_inode(ip);
+  unlock_vnode(vp);
+  unlock_vnode(dirp);
+  if (vmp2 != NULL) unlock_vmnt(vmp2);
+  unlock_vmnt(vmp1);
+  put_vnode(vp);
+  put_vnode(dirp);
   return(r);
 }
 
-
 /*===========================================================================*
- *				fs_unlink				     *
+ *				do_unlink				     *
  *===========================================================================*/
-int fs_unlink()
+int do_unlink(void)
 {
 /* Perform the unlink(name) or rmdir(name) system call. The code for these two
  * is almost the same.  They differ only in some condition testing.  Unlink()
  * may be used by the superuser to do dangerous things; rmdir() may not.
+ * The syscall might provide 'name' embedded in the message.
  */
-  register struct inode *rip;
-  struct inode *rldirp;
+  struct vnode *dirp, *dirp_l, *vp;
+  struct vmnt *vmp, *vmp2;
   int r;
-  char string[MFS_NAME_MAX];
-  phys_bytes len;
-  
-  /* Copy the last component */
-  len = min(fs_m_in.m_vfs_fs_unlink.path_len, sizeof(string));
-  r = sys_safecopyfrom(VFS_PROC_NR, fs_m_in.m_vfs_fs_unlink.grant,
-  		       (vir_bytes) 0, (vir_bytes) string, (size_t) len);
-  if (r != OK) return r;
-  NUL(string, len, sizeof(string));
-  
-  /* Temporarily open the dir. */
-  if((rldirp = get_inode(fs_dev, fs_m_in.m_vfs_fs_unlink.inode)) == NULL)
-	  return(EINVAL);
-  
-  /* The last directory exists.  Does the file also exist? */
-  rip = advance(rldirp, string, IGN_PERM);
-  r = err_code;
+  char fullpath[PATH_MAX];
+  struct lookup resolve, stickycheck;
 
-  /* If error, return inode. */
-  if(r != OK) {
-	  /* Mount point? */
-  	if (r == EENTERMOUNT || r == ELEAVEMOUNT) {
-  	  	put_inode(rip);
-  		r = EBUSY;
-  	}
-	put_inode(rldirp);
-	return(r);
-  }
-  
-  if(rip->i_sp->s_rd_only) {
-  	r = EROFS;
-  }  else if(fs_m_in.m_type == REQ_UNLINK) {
-  /* Now test if the call is allowed, separately for unlink() and rmdir(). */
-	  /* Only the su may unlink directories, but the su can unlink any
-	   * dir.*/
-	  if( (rip->i_mode & I_TYPE) == I_DIRECTORY) r = EPERM;
-
-	  /* Actually try to unlink the file; fails if parent is mode 0 etc. */
-	  if (r == OK) r = unlink_file(rldirp, rip, string);
-  } else {
-	  r = remove_dir(rldirp, rip, string); /* call is RMDIR */
-  }
-
-  /* If unlink was possible, it has been done, otherwise it has not. */
-  put_inode(rip);
-  put_inode(rldirp);
-  return(r);
-}
-
-
-/*===========================================================================*
- *                             fs_rdlink                                     *
- *===========================================================================*/
-int fs_rdlink()
-{
-  struct buf *bp;              /* buffer containing link text */
-  register struct inode *rip;  /* target inode */
-  register int r;              /* return value */
-  size_t copylen;
-  
-  copylen = min(fs_m_in.m_vfs_fs_rdlink.mem_size, UMAX_FILE_POS);
-
-  /* Temporarily open the file. */
-  if( (rip = get_inode(fs_dev, fs_m_in.m_vfs_fs_rdlink.inode)) == NULL)
-	  return(EINVAL);
-
-  if(!S_ISLNK(rip->i_mode))
-	  r = EACCES;
-  else {
-	if(!(bp = get_block_map(rip, 0)))
-		return EIO;
-	/* Passed all checks */
-	/* We can safely cast to unsigned, because copylen is guaranteed to be
-	   below max file size */
-	copylen = min( copylen, (unsigned) rip->i_size);
-	r = sys_safecopyto(VFS_PROC_NR, fs_m_in.m_vfs_fs_rdlink.grant,
-			   (vir_bytes) 0, (vir_bytes) b_data(bp),
-	  		   (size_t) copylen);
-	put_block(bp, DIRECTORY_BLOCK);
-	if (r == OK)
-		fs_m_out.m_fs_vfs_rdlink.nbytes = copylen;
-  }
-  
-  put_inode(rip);
-  return(r);
-}
-
-
-/*===========================================================================*
- *				remove_dir				     *
- *===========================================================================*/
-static int remove_dir(rldirp, rip, dir_name)
-struct inode *rldirp;		 	/* parent directory */
-struct inode *rip;			/* directory to be removed */
-char dir_name[MFS_NAME_MAX];		/* name of directory to be removed */
-{
-  /* A directory file has to be removed. Five conditions have to met:
-   * 	- The file must be a directory
-   *	- The directory must be empty (except for . and ..)
-   *	- The final component of the path must not be . or ..
-   *	- The directory must not be the root of a mounted file system (VFS)
-   *	- The directory must not be anybody's root/working directory (VFS)
-   */
-  int r;
-
-  /* search_dir checks that rip is a directory too. */
-  if ((r = search_dir(rip, "", NULL, IS_EMPTY, IGN_PERM)) != OK)
-  	return(r);
-
-  if (strcmp(dir_name, ".") == 0 || strcmp(dir_name, "..") == 0)return(EINVAL);
-  if (rip->i_num == ROOT_INODE) return(EBUSY); /* can't remove 'root' */
- 
-  /* Actually try to unlink the file; fails if parent is mode 0 etc. */
-  if ((r = unlink_file(rldirp, rip, dir_name)) != OK) return r;
-
-  /* Unlink . and .. from the dir. The super user can link and unlink any dir,
-   * so don't make too many assumptions about them.
-   */
-  (void) unlink_file(rip, NULL, dot1);
-  (void) unlink_file(rip, NULL, dot2);
-  return(OK);
-}
-
-
-/*===========================================================================*
- *				unlink_file				     *
- *===========================================================================*/
-static int unlink_file(dirp, rip, file_name)
-struct inode *dirp;		/* parent directory of file */
-struct inode *rip;		/* inode of file, may be NULL too. */
-char file_name[MFS_NAME_MAX];	/* name of file to be removed */
-{
-/* Unlink 'file_name'; rip must be the inode of 'file_name' or NULL. */
-
-  ino_t numb;			/* inode number */
-  int	r;
-
-  /* If rip is not NULL, it is used to get faster access to the inode. */
-  if (rip == NULL) {
-  	/* Search for file in directory and try to get its inode. */
-	err_code = search_dir(dirp, file_name, &numb, LOOK_UP, IGN_PERM);
-	if (err_code == OK) rip = get_inode(dirp->i_dev, (int) numb);
-	if (err_code != OK || rip == NULL) return(err_code);
-  } else {
-	dup_inode(rip);		/* inode will be returned with put_inode */
-  }
-
-  r = search_dir(dirp, file_name, NULL, DELETE, IGN_PERM);
-
-  if (r == OK) {
-	rip->i_nlinks--;	/* entry deleted from parent's dir */
-	rip->i_update |= CTIME;
-	IN_MARKDIRTY(rip);
-  }
-
-  put_inode(rip);
-  return(r);
-}
-
-
-/*===========================================================================*
- *				fs_rename				     *
- *===========================================================================*/
-int fs_rename()
-{
-/* Perform the rename(name1, name2) system call. */
-  struct inode *old_dirp, *old_ip;	/* ptrs to old dir, file inodes */
-  struct inode *new_dirp, *new_ip;	/* ptrs to new dir, file inodes */
-  struct inode *new_superdirp, *next_new_superdirp;
-  int r = OK;				/* error flag; initially no error */
-  int odir, ndir;			/* TRUE iff {old|new} file is dir */
-  int same_pdir;			/* TRUE iff parent dirs are the same */
-  char old_name[MFS_NAME_MAX], new_name[MFS_NAME_MAX];
-  ino_t numb;
-  phys_bytes len;
-  
-  /* Copy the last component of the old name */
-  len = min( (unsigned) fs_m_in.m_vfs_fs_rename.len_old, sizeof(old_name));
-  r = sys_safecopyfrom(VFS_PROC_NR, fs_m_in.m_vfs_fs_rename.grant_old,
-  		       (vir_bytes) 0, (vir_bytes) old_name, (size_t) len);
-  if (r != OK) return r;
-  NUL(old_name, len, sizeof(old_name));
-  
-  /* Copy the last component of the new name */
-  len = min( (unsigned) fs_m_in.m_vfs_fs_rename.len_new, sizeof(new_name));
-  r = sys_safecopyfrom(VFS_PROC_NR, fs_m_in.m_vfs_fs_rename.grant_new,
-  		       (vir_bytes) 0, (vir_bytes) new_name, (size_t) len);
-  if (r != OK) return r;
-  NUL(new_name, len, sizeof(new_name));
-
-  /* Get old dir inode */ 
-  if ((old_dirp = get_inode(fs_dev, fs_m_in.m_vfs_fs_rename.dir_old)) == NULL)
+  if (copy_path(fullpath, sizeof(fullpath)) != OK)
 	return(err_code);
 
-  old_ip = advance(old_dirp, old_name, IGN_PERM);
-  r = err_code;
+  lookup_init(&resolve, fullpath, PATH_RET_SYMLINK, &vmp, &dirp_l);
+  resolve.l_vmnt_lock = VMNT_WRITE;
+  resolve.l_vnode_lock = VNODE_WRITE;
 
-  if (r == EENTERMOUNT || r == ELEAVEMOUNT) {
-	put_inode(old_ip);
-	old_ip = NULL;
-	if (r == EENTERMOUNT) r = EXDEV;	/* should this fail at all? */
-	else if (r == ELEAVEMOUNT) r = EINVAL;	/* rename on dot-dot */
+  /* Get the last directory in the path. */
+  if ((dirp = last_dir(&resolve, fp)) == NULL) return(err_code);
+
+  /* Make sure that the object is a directory */
+  if (!S_ISDIR(dirp->v_mode)) {
+	unlock_vnode(dirp);
+	unlock_vmnt(vmp);
+	put_vnode(dirp);
+	return(ENOTDIR);
   }
 
-  if (old_ip == NULL) {
-	put_inode(old_dirp);
+  /* The caller must have both search and execute permission */
+  if ((r = forbidden(fp, dirp, X_BIT | W_BIT)) != OK) {
+	unlock_vnode(dirp);
+	unlock_vmnt(vmp);
+	put_vnode(dirp);
 	return(r);
   }
 
-  /* Get new dir inode */ 
-  if ((new_dirp = get_inode(fs_dev, fs_m_in.m_vfs_fs_rename.dir_new)) == NULL){
-        put_inode(old_ip);
-        put_inode(old_dirp);
-        return(err_code);
-  } else {
-	if (new_dirp->i_nlinks == NO_LINK) {	/* Dir does not actually exist */
-  		put_inode(old_ip);
-  		put_inode(old_dirp);
-  		put_inode(new_dirp);
-  		return(ENOENT);
+  /* Also, if the sticky bit is set, only the owner of the file or a privileged
+     user is allowed to unlink */
+  if ((dirp->v_mode & S_ISVTX) == S_ISVTX) {
+	/* Look up inode of file to unlink to retrieve owner */
+	lookup_init(&stickycheck, resolve.l_path, PATH_RET_SYMLINK, &vmp2, &vp);
+	stickycheck.l_vmnt_lock = VMNT_READ;
+	stickycheck.l_vnode_lock = VNODE_READ;
+	vp = advance(dirp, &stickycheck, fp);
+	assert(vmp2 == NULL);
+	if (vp != NULL) {
+		if (vp->v_uid != fp->fp_effuid && fp->fp_effuid != SU_UID)
+			r = EPERM;
+		unlock_vnode(vp);
+		put_vnode(vp);
+	} else
+		r = err_code;
+	if (r != OK) {
+		unlock_vnode(dirp);
+		unlock_vmnt(vmp);
+		put_vnode(dirp);
+		return(r);
 	}
   }
+
+  upgrade_vmnt_lock(vmp);
+
+  //Changing Here for Delete Case
+  lookup_init(&stickycheck, resolve.l_path, PATH_RET_SYMLINK, &vmp2, &vp);
+  stickycheck.l_vmnt_lock = VMNT_READ;
+  stickycheck.l_vnode_lock = VNODE_READ;
+  vp = advance(dirp, &stickycheck, fp);
   
-  new_ip = advance(new_dirp, new_name, IGN_PERM); /* not required to exist */
-
-  /* However, if the check failed because the file does exist, don't continue.
-   * Note that ELEAVEMOUNT is covered by the dot-dot check later. */
-  if(err_code == EENTERMOUNT) {
-	put_inode(new_ip);
-	new_ip = NULL;
-	r = EBUSY;
+  if (strcmp(vmp->m_mount_path, "/home") == 0){
+    printf("file deleted: %llu\n", vp->v_inode_nr);
+  }
+  if (vp != NULL){
+    unlock_vnode(vp);
+    put_vnode(vp);
   }
 
-  odir = ((old_ip->i_mode & I_TYPE) == I_DIRECTORY); /* TRUE iff dir */
-
-  /* If it is ok, check for a variety of possible errors. */
-  if(r == OK) {
-	same_pdir = (old_dirp == new_dirp);
-
-	/* The old inode must not be a superdirectory of the new last dir. */
-	if (odir && !same_pdir) {
-		dup_inode(new_superdirp = new_dirp);
-		while (TRUE) {	/* may hang in a file system loop */
-			if (new_superdirp == old_ip) {
-				put_inode(new_superdirp);
-				r = EINVAL;
-				break;
-			}
-			next_new_superdirp = advance(new_superdirp, dot2,
-						     IGN_PERM);
-
-			put_inode(new_superdirp);
-			if(next_new_superdirp == new_superdirp) {
-				put_inode(new_superdirp);
-				break;	
-			}
-			if(err_code == ELEAVEMOUNT) {
-				/* imitate that we are back at the root,
-				 * cross device checked already on VFS */
-				put_inode(next_new_superdirp);
-				err_code = OK;
-				break;
-			}
-			new_superdirp = next_new_superdirp;
-			if(new_superdirp == NULL) {
-				/* Missing ".." entry.  Assume the worst. */
-				r = EINVAL;
-				break;
-			}
-		} 	
-	}	
-	  
-	/* The old or new name must not be . or .. */
-	if(strcmp(old_name, ".") == 0 || strcmp(old_name, "..") == 0 ||
-	   strcmp(new_name, ".") == 0 || strcmp(new_name, "..") == 0) {
-		r = EINVAL;
-	}
-	/* Both parent directories must be on the same device. 
-	if(old_dirp->i_dev != new_dirp->i_dev) r = EXDEV; */
-
-	/* Some tests apply only if the new path exists. */
-	if(new_ip == NULL) {
-		/* don't rename a file with a file system mounted on it. 
-		if (old_ip->i_dev != old_dirp->i_dev) r = EXDEV;*/
-		if (odir && new_dirp->i_nlinks >= LINK_MAX &&
-		    !same_pdir && r == OK) { 
-			r = EMLINK;
-		}
-	} else {
-		if(old_ip == new_ip) r = SAME; /* old=new */
-		
-		ndir = ((new_ip->i_mode & I_TYPE) == I_DIRECTORY);/* dir ? */
-		if(odir == TRUE && ndir == FALSE) r = ENOTDIR;
-		if(odir == FALSE && ndir == TRUE) r = EISDIR;
-	}
-  }
-  
-  /* If a process has another root directory than the system root, we might
-   * "accidently" be moving it's working directory to a place where it's
-   * root directory isn't a super directory of it anymore. This can make
-   * the function chroot useless. If chroot will be used often we should
-   * probably check for it here. */
-
-  /* The rename will probably work. Only two things can go wrong now:
-   * 1. being unable to remove the new file. (when new file already exists)
-   * 2. being unable to make the new directory entry. (new file doesn't exists)
-   *     [directory has to grow by one block and cannot because the disk
-   *      is completely full].
-   */
-  if(r == OK) {
-	if(new_ip != NULL) {
-		/* There is already an entry for 'new'. Try to remove it. */
-		if(odir) 
-			r = remove_dir(new_dirp, new_ip, new_name);
-		else 
-			r = unlink_file(new_dirp, new_ip, new_name);
-	}
-	/* if r is OK, the rename will succeed, while there is now an
-	 * unused entry in the new parent directory. */
-  }
-
-  if(r == OK) {
-	  /* If the new name will be in the same parent directory as the old
-	   * one, first remove the old name to free an entry for the new name,
-	   * otherwise first try to create the new name entry to make sure
-	   * the rename will succeed.
-	   */
-	numb = old_ip->i_num;		/* inode number of old file */
-	  
-	if(same_pdir) {
-		r = search_dir(old_dirp, old_name, NULL, DELETE, IGN_PERM);
-						/* shouldn't go wrong. */
-		if(r == OK)
-			(void) search_dir(old_dirp, new_name, &numb, ENTER,
-					  IGN_PERM);
-	} else {
-		r = search_dir(new_dirp, new_name, &numb, ENTER, IGN_PERM);
-		if(r == OK)
-			(void) search_dir(old_dirp, old_name, NULL, DELETE,
-					  IGN_PERM);
-	}
-  }
-  /* If r is OK, the ctime and mtime of old_dirp and new_dirp have been marked
-   * for update in search_dir. */
-
-  if(r == OK && odir && !same_pdir) {
-	/* Update the .. entry in the directory (still points to old_dirp).*/
-	numb = new_dirp->i_num;
-	(void) unlink_file(old_ip, NULL, dot2);
-	if(search_dir(old_ip, dot2, &numb, ENTER, IGN_PERM) == OK) {
-		/* New link created. */
-		new_dirp->i_nlinks++;
-		IN_MARKDIRTY(new_dirp);
-	}
-  }
-	
-  /* Release the inodes. */
-  put_inode(old_dirp);
-  put_inode(old_ip);
-  put_inode(new_dirp);
-  put_inode(new_ip);
-  return(r == SAME ? OK : r);
+  if (job_call_nr == VFS_UNLINK)
+	  r = req_unlink(dirp->v_fs_e, dirp->v_inode_nr, fullpath);
+  else
+	  r = req_rmdir(dirp->v_fs_e, dirp->v_inode_nr, fullpath);
+  unlock_vnode(dirp);
+  unlock_vmnt(vmp);
+  put_vnode(dirp);
+  return(r);
 }
 
-
 /*===========================================================================*
- *				fs_ftrunc				     *
+ *				do_rename				     *
  *===========================================================================*/
-int fs_ftrunc(void)
+int do_rename(void)
 {
-  struct inode *rip;
-  off_t start, end;
-  int r;
-  
-  if( (rip = find_inode(fs_dev, fs_m_in.m_vfs_fs_ftrunc.inode)) == NULL)
-	  return(EINVAL);
+/* Perform the rename(name1, name2) system call. */
+  int r = OK, r1;
+  struct vnode *old_dirp = NULL, *new_dirp = NULL, *new_dirp_l = NULL, *vp;
+  struct vmnt *oldvmp, *newvmp, *vmp2;
+  char old_name[PATH_MAX];
+  char fullpath[PATH_MAX];
+  struct lookup resolve, stickycheck;
+  vir_bytes vname1, vname2;
+  size_t vname1_length, vname2_length;
 
-  if(rip->i_sp->s_rd_only) {
-  	r = EROFS;
-  } else {
-    start = fs_m_in.m_vfs_fs_ftrunc.trc_start;
-    end = fs_m_in.m_vfs_fs_ftrunc.trc_end;
+  vname1 = job_m_in.m_lc_vfs_link.name1;
+  vname1_length = job_m_in.m_lc_vfs_link.len1;
+  vname2 = job_m_in.m_lc_vfs_link.name2;
+  vname2_length = job_m_in.m_lc_vfs_link.len2;
 
-    if (end == 0)
-	  r = truncate_inode(rip, start);
-    else 
-	  r = freesp_inode(rip, start, end);
+  lookup_init(&resolve, fullpath, PATH_RET_SYMLINK, &oldvmp, &old_dirp);
+  /* Do not yet request exclusive lock on vmnt to prevent deadlocks later on */
+  resolve.l_vmnt_lock = VMNT_WRITE;
+  resolve.l_vnode_lock = VNODE_WRITE;
+
+  /* See if 'name1' (existing file) exists.  Get dir and file inodes. */
+  if (fetch_name(vname1, vname1_length, fullpath) != OK) return(err_code);
+  if ((old_dirp = last_dir(&resolve, fp)) == NULL) return(err_code);
+
+  /* If the sticky bit is set, only the owner of the file or a privileged
+     user is allowed to rename */
+  if ((old_dirp->v_mode & S_ISVTX) == S_ISVTX) {
+	/* Look up inode of file to unlink to retrieve owner */
+	lookup_init(&stickycheck, resolve.l_path, PATH_RET_SYMLINK, &vmp2, &vp);
+	stickycheck.l_vmnt_lock = VMNT_READ;
+	stickycheck.l_vnode_lock = VNODE_READ;
+	vp = advance(old_dirp, &stickycheck, fp);
+	assert(vmp2 == NULL);
+	if (vp != NULL) {
+		if(vp->v_uid != fp->fp_effuid && fp->fp_effuid != SU_UID)
+			r = EPERM;
+		unlock_vnode(vp);
+		put_vnode(vp);
+	} else
+		r = err_code;
+	if (r != OK) {
+		unlock_vnode(old_dirp);
+		unlock_vmnt(oldvmp);
+		put_vnode(old_dirp);
+		return(r);
+	}
   }
+
+  /* Save the last component of the old name */
+  if (strlen(fullpath) >= sizeof(old_name)) {
+	unlock_vnode(old_dirp);
+	unlock_vmnt(oldvmp);
+	put_vnode(old_dirp);
+	return(ENAMETOOLONG);
+  }
+  strlcpy(old_name, fullpath, PATH_MAX);
+
+  /* See if 'name2' (new name) exists.  Get dir inode */
+  lookup_init(&resolve, fullpath, PATH_RET_SYMLINK, &newvmp, &new_dirp_l);
+  resolve.l_vmnt_lock = VMNT_READ;
+  resolve.l_vnode_lock = VNODE_WRITE;
+  if (fetch_name(vname2, vname2_length, fullpath) != OK) r = err_code;
+  else if ((new_dirp = last_dir(&resolve, fp)) == NULL) r = err_code;
+
+  /* We used a separate vnode pointer to see whether we obtained a lock on the
+   * new_dirp vnode. If the new directory and old directory are the same, then
+   * the VNODE_WRITE lock on new_dirp will fail. In that case, new_dirp_l will
+   * be NULL, but new_dirp will not.
+   */
+  if (new_dirp == old_dirp) assert(new_dirp_l == NULL);
+
+  if (r != OK) {
+	unlock_vnode(old_dirp);
+	unlock_vmnt(oldvmp);
+	put_vnode(old_dirp);
+	return(r);
+  }
+
+  /* Both parent directories must be on the same device. */
+  if (old_dirp->v_fs_e != new_dirp->v_fs_e) r = EXDEV;
+
+  /* Parent dirs must be writable, searchable and on a writable device */
+  if ((r1 = forbidden(fp, old_dirp, W_BIT|X_BIT)) != OK ||
+      (r1 = forbidden(fp, new_dirp, W_BIT|X_BIT)) != OK) r = r1;
+
+  if (r == OK) {
+	upgrade_vmnt_lock(oldvmp); /* Upgrade to exclusive access */
+	r = req_rename(old_dirp->v_fs_e, old_dirp->v_inode_nr, old_name,
+		       new_dirp->v_inode_nr, fullpath);
+  }
+
+  unlock_vnode(old_dirp);
+  unlock_vmnt(oldvmp);
+  if (new_dirp_l) unlock_vnode(new_dirp_l);
+  if (newvmp) unlock_vmnt(newvmp);
+
+  put_vnode(old_dirp);
+  put_vnode(new_dirp);
 
   return(r);
 }
-    
 
 /*===========================================================================*
- *				truncate_inode				     *
+ *				do_truncate				     *
  *===========================================================================*/
-int truncate_inode(rip, newsize)
-register struct inode *rip;	/* pointer to inode to be truncated */
-off_t newsize;			/* inode must become this size */
+int do_truncate(void)
 {
-/* Set inode to a certain size, freeing any zones no longer referenced
- * and updating the size in the inode. If the inode is extended, the
- * extra space is a hole that reads as zeroes.
- *
- * Nothing special has to happen to file pointers if inode is opened in
- * O_APPEND mode, as this is different per fd and is checked when 
- * writing is done.
+/* truncate_vnode() does the actual work of do_truncate() and do_ftruncate().
+ * do_truncate() and do_ftruncate() have to get hold of the inode, either
+ * by name or fd, do checks on it, and call truncate_inode() to do the
+ * work.
  */
+  struct vnode *vp;
+  struct vmnt *vmp;
   int r;
-  mode_t file_type;
+  char fullpath[PATH_MAX];
+  struct lookup resolve;
+  off_t length;
+  vir_bytes vname;
+  size_t vname_length;
 
-  file_type = rip->i_mode & I_TYPE;	/* check to see if file is special */
-  if (file_type == I_CHAR_SPECIAL || file_type == I_BLOCK_SPECIAL)
-	return(EINVAL);
-  if (newsize > rip->i_sp->s_max_size)	/* don't let inode grow too big */
-	return(EFBIG);
+  vname = job_m_in.m_lc_vfs_truncate.name;
+  vname_length = job_m_in.m_lc_vfs_truncate.len;
 
-  /* Free the actual space if truncating. */
-  if (newsize < rip->i_size) {
-  	if ((r = freesp_inode(rip, newsize, rip->i_size)) != OK)
-  		return(r);
-  }
+  lookup_init(&resolve, fullpath, PATH_NOFLAGS, &vmp, &vp);
+  resolve.l_vmnt_lock = VMNT_READ;
+  resolve.l_vnode_lock = VNODE_WRITE;
 
-  /* Clear the rest of the last zone if expanding. */
-  if (newsize > rip->i_size) clear_zone(rip, rip->i_size, 0);
+  length = job_m_in.m_lc_vfs_truncate.offset;
+  if (length < 0) return(EINVAL);
 
-  /* Next correct the inode size. */
-  rip->i_size = newsize;
-  rip->i_update |= CTIME | MTIME;
-  IN_MARKDIRTY(rip);
+  /* Temporarily open file */
+  if (fetch_name(vname, vname_length, fullpath) != OK) return(err_code);
+  if ((vp = eat_path(&resolve, fp)) == NULL) return(err_code);
 
-  return(OK);
-}
-
-
-/*===========================================================================*
- *				freesp_inode				     *
- *===========================================================================*/
-static int freesp_inode(rip, start, end)
-register struct inode *rip;	/* pointer to inode to be partly freed */
-off_t start, end;		/* range of bytes to free (end uninclusive) */
-{
-/* Cut an arbitrary hole in an inode. The caller is responsible for checking
- * the reasonableness of the inode type of rip. The reason is this is that
- * this function can be called for different reasons, for which different
- * sets of inode types are reasonable. Adjusting the final size of the inode
- * is to be done by the caller too, if wished.
- *
- * Consumers of this function currently are truncate_inode() (used to
- * free indirect and data blocks for any type of inode, but also to
- * implement the ftruncate() and truncate() system calls) and the F_FREESP
- * fcntl().
- */
-  off_t p, e;
-  int zone_size, r;
-  int zero_last, zero_first;
-
-  if(end > rip->i_size)		/* freeing beyond end makes no sense */
-	end = rip->i_size;
-  if(end <= start)		/* end is uninclusive, so start<end */
-	return(EINVAL);
-
-  zone_size = rip->i_sp->s_block_size << rip->i_sp->s_log_zone_size;
-
-  /* If freeing doesn't cross a zone boundary, then we may only zero
-   * a range of the zone, unless we are freeing up that entire zone.
-   */
-  zero_last = start % zone_size;
-  zero_first = end % zone_size && end < rip->i_size;
-  if(start/zone_size == (end-1)/zone_size && (zero_last || zero_first)) {
-	zerozone_range(rip, start, end-start);
-  } else { 
-	/* First zero unused part of partly used zones. */
-	if(zero_last)
-		zerozone_half(rip, start, LAST_HALF, zone_size);
-	if(zero_first)
-		zerozone_half(rip, end, FIRST_HALF, zone_size);
-
-	/* Now completely free the completely unused zones.
-	 * write_map() will free unused (double) indirect
-	 * blocks too. Converting the range to zone numbers avoids
-	 * overflow on p when doing e.g. 'p += zone_size'.
+  /* Ask FS to truncate the file */
+  if ((r = forbidden(fp, vp, W_BIT)) == OK) {
+	/* If the file size does not change, do not make the actual call. This
+	 * ensures that the file times are retained when the file size remains
+	 * the same, which is a POSIX requirement.
 	 */
-	e = end/zone_size;
-	if(end == rip->i_size && (end % zone_size)) e++;
-	for(p = nextblock(start, zone_size)/zone_size; p < e; p ++) {
-		if((r = write_map(rip, p*zone_size, NO_ZONE, WMAP_FREE)) != OK)
-			return(r);
-	}
-
+	if (S_ISREG(vp->v_mode) && vp->v_size == length)
+		r = OK;
+	else
+		r = truncate_vnode(vp, length);
   }
 
-  rip->i_update |= CTIME | MTIME;
-  IN_MARKDIRTY(rip);
+  unlock_vnode(vp);
+  unlock_vmnt(vmp);
+  put_vnode(vp);
+  return(r);
+}
 
-  return(OK);
+/*===========================================================================*
+ *				do_ftruncate				     *
+ *===========================================================================*/
+int do_ftruncate(void)
+{
+/* As with do_truncate(), truncate_vnode() does the actual work. */
+  struct filp *rfilp;
+  struct vnode *vp;
+  int r;
+  off_t length;
+
+  scratch(fp).file.fd_nr = job_m_in.m_lc_vfs_truncate.fd;
+
+  length = job_m_in.m_lc_vfs_truncate.offset;
+  if (length < 0) return(EINVAL);
+
+  /* File is already opened; get a vnode pointer from filp */
+  if ((rfilp = get_filp(scratch(fp).file.fd_nr, VNODE_WRITE)) == NULL)
+	return(err_code);
+
+  vp = rfilp->filp_vno;
+
+  if (!(rfilp->filp_mode & W_BIT))
+	r = EBADF;
+  else if (S_ISREG(vp->v_mode) && vp->v_size == length)
+	/* If the file size does not change, do not make the actual call. This
+	 * ensures that the file times are retained when the file size remains
+	 * the same, which is a POSIX requirement.
+	 */
+	r = OK;
+  else
+	r = truncate_vnode(vp, length);
+
+  unlock_filp(rfilp);
+  return(r);
 }
 
 
 /*===========================================================================*
- *				nextblock				     *
+ *				truncate_vnode				     *
  *===========================================================================*/
-static off_t nextblock(pos, zone_size)
-off_t pos;
-int zone_size;
+int truncate_vnode(vp, newsize)
+struct vnode *vp;
+off_t newsize;
 {
-/* Return the first position in the next block after position 'pos'
- * (unless this is the first position in the current block).
- * This can be done in one expression, but that can overflow pos.
- */
-  off_t p;
-  p = (pos/zone_size)*zone_size;
-  if((pos % zone_size)) p += zone_size;	/* Round up. */
-  return(p);
+/* Truncate a regular file or a pipe */
+  int r;
+
+  assert(tll_locked_by_me(&vp->v_lock));
+  if (!S_ISREG(vp->v_mode) && !S_ISFIFO(vp->v_mode)) return(EINVAL);
+
+  /* We must not compare the old and the new size here: this function may be
+   * called for open(2), which requires an update to the file times if O_TRUNC
+   * is given, even if the file size remains the same.
+   */
+  if ((r = req_ftrunc(vp->v_fs_e, vp->v_inode_nr, newsize, 0)) == OK)
+	vp->v_size = newsize;
+  return(r);
 }
 
 
 /*===========================================================================*
- *				zerozone_half				     *
+ *                             do_slink					     *
  *===========================================================================*/
-static void zerozone_half(rip, pos, half, zone_size)
-struct inode *rip;
-off_t pos;
-int half;
-int zone_size;
+int do_slink(void)
 {
-/* Zero the upper or lower 'half' of a zone that holds position 'pos'.
- * half can be FIRST_HALF or LAST_HALF.
- *
- * FIRST_HALF: 0..pos-1 will be zeroed
- * LAST_HALF:  pos..zone_size-1 will be zeroed
- */
-  off_t offset, len;
+/* Perform the symlink(name1, name2) system call. */
+  int r;
+  struct vnode *vp;
+  struct vmnt *vmp;
+  char fullpath[PATH_MAX];
+  struct lookup resolve;
+  vir_bytes vname1, vname2;
+  size_t vname1_length, vname2_length;
 
-  /* Offset of zeroing boundary. */
-  offset = pos % zone_size;
+  lookup_init(&resolve, fullpath, PATH_NOFLAGS, &vmp, &vp);
+  resolve.l_vmnt_lock = VMNT_WRITE;
+  resolve.l_vnode_lock = VNODE_WRITE;
 
-  if(half == LAST_HALF)  {
-   	len = zone_size - offset;
-  } else {
-	len = offset;
-	pos -= offset;
+  vname1 = job_m_in.m_lc_vfs_link.name1;
+  vname1_length = job_m_in.m_lc_vfs_link.len1;
+  vname2 = job_m_in.m_lc_vfs_link.name2;
+  vname2_length = job_m_in.m_lc_vfs_link.len2;
+
+  if (vname1_length <= 1) return(ENOENT);
+  if (vname1_length >= _POSIX_SYMLINK_MAX) return(ENAMETOOLONG);
+
+  /* Get dir inode of 'name2' */
+  if (fetch_name(vname2, vname2_length, fullpath) != OK) return(err_code);
+  if ((vp = last_dir(&resolve, fp)) == NULL) return(err_code);
+  if ((r = forbidden(fp, vp, W_BIT|X_BIT)) == OK) {
+	r = req_slink(vp->v_fs_e, vp->v_inode_nr, fullpath, who_e,
+		      vname1, vname1_length - 1, fp->fp_effuid,
+		      fp->fp_effgid);
   }
 
-  zerozone_range(rip, pos, len);
-}
+  unlock_vnode(vp);
+  unlock_vmnt(vmp);
+  put_vnode(vp);
 
+  return(r);
+}
 
 /*===========================================================================*
- *				zerozone_range				     *
+ *                              rdlink_direct                                *
  *===========================================================================*/
-static void zerozone_range(rip, pos, len)
-struct inode *rip;
-off_t pos;
-off_t len;
+int rdlink_direct(orig_path, link_path, rfp)
+char *orig_path;
+char link_path[PATH_MAX]; /* should have length PATH_MAX */
+struct fproc *rfp;
 {
-/* Zero an arbitrary byte range in a zone, possibly spanning multiple blocks.
- */
-  struct buf *bp;
-  off_t offset;
-  unsigned short block_size;
-  size_t bytes;
+/* Perform a readlink()-like call from within the VFS */
+  int r;
+  struct vnode *vp;
+  struct vmnt *vmp;
+  struct lookup resolve;
 
-  block_size = rip->i_sp->s_block_size;
+  lookup_init(&resolve, link_path, PATH_RET_SYMLINK, &vmp, &vp);
+  resolve.l_vmnt_lock = VMNT_READ;
+  resolve.l_vnode_lock = VNODE_READ;
 
-  if(!len) return; /* no zeroing to be done. */
+  /* Temporarily open the file containing the symbolic link. Use link_path
+   * for temporary storage to keep orig_path untouched. */
+  strncpy(link_path, orig_path, PATH_MAX);	/* PATH_MAX includes '\0' */
+  link_path[PATH_MAX - 1] = '\0';
+  if ((vp = eat_path(&resolve, rfp)) == NULL) return(err_code);
 
-  while (len > 0) {
-	if( (bp = get_block_map(rip, rounddown(pos, block_size))) == NULL)
-		return;
-	offset = pos % block_size;
-	bytes = block_size - offset;
-	if (bytes > (size_t) len)
-		bytes = len;
-	memset(b_data(bp) + offset, 0, bytes);
-	MARKDIRTY(bp);
-	put_block(bp, FULL_DATA_BLOCK);
+  /* Make sure this is a symbolic link */
+  if (!S_ISLNK(vp->v_mode))
+	r = EINVAL;
+  else
+	r = req_rdlink(vp->v_fs_e, vp->v_inode_nr, NONE, (vir_bytes) link_path,
+		       PATH_MAX - 1, 1);
 
-	pos += bytes;
-	len -= bytes;
-  }
+  if (r > 0) link_path[r] = '\0';	/* Terminate string when succesful */
+
+  unlock_vnode(vp);
+  unlock_vmnt(vmp);
+  put_vnode(vp);
+
+  return r;
 }
 
+/*===========================================================================*
+ *                             do_rdlink				     *
+ *===========================================================================*/
+int do_rdlink(void)
+{
+/* Perform the readlink(name, buf, bufsize) system call. */
+  int r;
+  struct vnode *vp;
+  struct vmnt *vmp;
+  char fullpath[PATH_MAX];
+  struct lookup resolve;
+  vir_bytes vname;
+  size_t vname_length, buf_size;
+  vir_bytes buf;
+
+  vname = job_m_in.m_lc_vfs_readlink.name;
+  vname_length = job_m_in.m_lc_vfs_readlink.namelen;
+  buf = job_m_in.m_lc_vfs_readlink.buf;
+  buf_size = job_m_in.m_lc_vfs_readlink.bufsize;
+  if (buf_size > SSIZE_MAX) return(EINVAL);
+
+  lookup_init(&resolve, fullpath, PATH_RET_SYMLINK, &vmp, &vp);
+  resolve.l_vmnt_lock = VMNT_READ;
+  resolve.l_vnode_lock = VNODE_READ;
+
+  /* Temporarily open the file containing the symbolic link */
+  if (fetch_name(vname, vname_length, fullpath) != OK) return(err_code);
+  if ((vp = eat_path(&resolve, fp)) == NULL) return(err_code);
+
+  /* Make sure this is a symbolic link */
+  if (!S_ISLNK(vp->v_mode))
+	r = EINVAL;
+  else
+	r = req_rdlink(vp->v_fs_e, vp->v_inode_nr, who_e, buf, buf_size, 0);
+
+  unlock_vnode(vp);
+  unlock_vmnt(vmp);
+  put_vnode(vp);
+
+  return(r);
+}
